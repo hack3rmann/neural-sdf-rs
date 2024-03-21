@@ -129,7 +129,8 @@ impl Initializer {
         transition.biases.fill(0.0);
 
         let mut rng = rand::thread_rng();
-        let range = f32::sqrt(6.0 / transition.input_len() as f32);
+        let range = f32::sqrt(6.0 / transition.input_len() as f32)
+            / ActivationFunction::SIN_SCALE;
 
         transition.weights.values.fill_with(|| {
             2.0 * range * rng.gen::<f32>() - range
@@ -256,12 +257,12 @@ assert_impl_all!(ActivationFunction: Send, Sync);
 
 impl ActivationFunction {
     /// Sine activation function parameter
-    pub const SIN_SIZE: f32 = 30.0;
+    pub const SIN_SCALE: f32 = 30.0;
 
     /// Gives activation function evaluator
     pub const fn evaluator(self) -> fn(f32) -> f32 {
         match self {
-            Self::Sin => |value| f32::sin(Self::SIN_SIZE * value),
+            Self::Sin => |value| f32::sin(Self::SIN_SCALE * value),
             Self::Sigmoid => |value| 1.0 / (1.0 + f32::exp(-value)),
             Self::Relu => |value| value.max(0.0),
             Self::Id => |value| value,
@@ -277,7 +278,7 @@ impl ActivationFunction {
     pub fn differential(self) -> fn(f32, Option<f32>) -> f32 {
         match self {
             Self::Sin => |value, _|
-                Self::SIN_SIZE * f32::cos(Self::SIN_SIZE * value),
+                Self::SIN_SCALE * f32::cos(Self::SIN_SCALE * value),
             Self::Sigmoid => |value, prev| match prev {
                 Some(prev) => prev * (1.0 - prev),
                 None => {
@@ -383,12 +384,10 @@ impl LayerTransition {
     pub fn mul_add(&mut self, other: &Self, mul: f32) {
         use rayon::prelude::*;
 
-        self.dense.weights.values.par_iter_mut()
-            .chain(self.dense.biases.par_iter_mut())
-            .zip(other.dense.weights.values.par_iter()
-               .chain(other.dense.biases.par_iter()))
+        self.dense.par_values_mut()
+            .zip(other.par_values())
             .for_each(move |(this, other)| {
-                *this += mul * *other;
+                *this += mul * other;
             });
     }
 }
@@ -845,18 +844,19 @@ impl Trainer {
     }
 
     pub fn execute(&mut self, network: &mut Network, log: TrainLog) {
-        use shuffle::shuffler::Shuffler;
-        use shuffle::irs::Irs;
-        
-        let mut rng = rand::thread_rng();
-        let mut irs = Irs::default();
+        let is_logging_enabled = matches!(log, TrainLog::DrawLoading);
 
-        for _ in kdam::tqdm!(0..self.n_iterations, position = 0) {
-            let _ = irs.shuffle(&mut self.dataset.data, &mut rng);
+        if is_logging_enabled {
+            _ = kdam::term::hide_cursor();
+        }
 
+        for _ in kdam::tqdm!(0..self.n_iterations, desc = "Training", position = 0) {
             self.gradient.fill(0.0);
 
-            for (input, expectation) in kdam::tqdm!(self.dataset[0..self.batch_size].iter(), position = 1) {
+            for _ in kdam::tqdm!(0..self.batch_size, desc = "Calculating gradient", position = 1) {
+                let index = rand::random::<usize>() % self.dataset.len();
+                let (input, expectation) = &self.dataset[index];
+                
                 network.execute(input, &mut self.neurons);
                 network.propagate_back(
                     &mut self.grad_buf,
@@ -872,6 +872,12 @@ impl Trainer {
             }
 
             self.optimizer.apply_gradient(network, &self.gradient);
+        }
+
+        
+        if is_logging_enabled {
+            _ = kdam::term::show_cursor();
+            eprint!("\n\n");
         }
     }
 
