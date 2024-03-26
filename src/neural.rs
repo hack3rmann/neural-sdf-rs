@@ -2,6 +2,7 @@ use crate::{math::{Vector, Matrix}, util::*};
 use rayon::iter::IndexedParallelIterator;
 use static_assertions::*;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 
 
@@ -445,10 +446,10 @@ impl Neurons {
 
 
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq)]
 #[derive(Serialize, Deserialize)]
 pub struct NetworkLayout {
-    pub layer_sizes: Vec<usize>,
+    pub layer_sizes: Arc<[usize]>,
 }
 
 impl NetworkLayout {
@@ -461,7 +462,7 @@ impl NetworkLayout {
             layer_sizes.push(transition.output_len());
         }
 
-        Self { layer_sizes }
+        Self { layer_sizes: layer_sizes.into() }
     }
 
     pub fn transitions(&self)
@@ -653,6 +654,7 @@ impl Network {
 
 pub trait Optimizer: Send + Sync + 'static {
     fn apply_gradient(&mut self, network: &mut Network, gradient: &Network);
+    fn reset(&mut self);
 }
 assert_obj_safe!(Optimizer);
 
@@ -673,15 +675,18 @@ impl Optimizer for Constant {
     fn apply_gradient(&mut self, network: &mut Network, gradient: &Network) {
         network.sub_gradient(gradient, self.learning_rate);
     }
+
+    fn reset(&mut self) { }
 }
 
 
 
 #[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Serialize, Deserialize)]
 pub struct Adam {
     pub first_decay: f32,
     pub second_decay: f32,
-    time_step: usize,
+    time: i32,
     step_size: f32,
     first_momentum: Network,
     second_momentum: Network,
@@ -690,17 +695,17 @@ pub struct Adam {
 assert_impl_all!(Adam: Send, Sync);
 
 impl Adam {
-    const FIRST_EXP_DECAY_DEFAULT: f32 = 0.9;
-    const SECOND_EXP_DECAY_DEFAULT: f32 = 0.999;
+    const FIRST_DECAY_DEFAULT: f32 = 0.9;
+    const SECOND_DECAY_DEFAULT: f32 = 0.999;
 
     pub fn new(learning_rate: f32, layout: &NetworkLayout) -> Self {
         let first_momentum = layout.allocate_gradient();
         let second_momentum = first_momentum.clone();
 
         Self {
-            first_decay: Self::FIRST_EXP_DECAY_DEFAULT,
-            second_decay: Self::SECOND_EXP_DECAY_DEFAULT,
-            time_step: 0,
+            first_decay: Self::FIRST_DECAY_DEFAULT,
+            second_decay: Self::SECOND_DECAY_DEFAULT,
+            time: 0,
             eps: 1e-8,
             step_size: learning_rate,
             first_momentum,
@@ -721,13 +726,28 @@ impl Adam {
     pub fn decays(self, decay1: f32, decay2: f32) -> Self {
         self.first_decay(decay1).second_decay(decay2)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_value(
+        time: i32, eps: f32, decay1: f32, decay2: f32, step_size: f32,
+        momentum1: &mut f32, momentum2: &mut f32,
+        gradient: f32, network: &mut f32,
+    ) {
+        *momentum1 = decay1 * *momentum1 + (1.0 - decay1) * gradient;
+        *momentum2 = decay2 * *momentum2 + (1.0 - decay2) * gradient.powi(2);
+
+        let first_estimate = *momentum1 / (1.0 - decay1.powi(time));
+        let second_estimate = *momentum2 / (1.0 - decay2.powi(time));
+
+        *network -= step_size * first_estimate / (second_estimate.sqrt() + eps);
+    }
 }
 
 impl Optimizer for Adam {
     fn apply_gradient(&mut self, network: &mut Network, gradient: &Network) {
         use rayon::prelude::*;
 
-        self.time_step += 1;
+        self.time += 1;
 
         self.first_momentum.transitions.par_iter_mut()
             .zip(self.second_momentum.transitions.par_iter_mut())
@@ -740,24 +760,24 @@ impl Optimizer for Adam {
                     .zip(network.par_values_mut())
             })
             .for_each(|(((momentum1, momentum2), gradient), network)| {
-                let decay1 = self.first_decay;
-                let decay2 = self.second_decay;
-
-                *momentum1 = decay1 * *momentum1
-                    + (1.0 - decay1) * gradient;
-
-                *momentum2 = decay2 * *momentum2
-                    + (1.0 - decay2) * gradient * gradient;
-
-                let first_estimate = *momentum1
-                    / (1.0 - decay1.powi(self.time_step as i32));
-
-                let second_estimate = *momentum2
-                    / (1.0 - decay2.powi(self.time_step as i32));
-
-                *network -= self.step_size * first_estimate
-                    / (second_estimate.sqrt() + self.eps);
+                Self::update_value(
+                    self.time,
+                    self.eps,
+                    self.first_decay,
+                    self.second_decay,
+                    self.step_size,
+                    momentum1,
+                    momentum2,
+                    gradient,
+                    network,
+                );
             });
+    }
+
+    fn reset(&mut self) {
+        self.first_momentum.fill(0.0);
+        self.second_momentum.fill(0.0);
+        self.time = 0;
     }
 }
 
@@ -809,14 +829,15 @@ pub enum TrainLog {
     #[default]
     Silent,
 }
+assert_impl_all!(TrainLog: Send, Sync);
 
 
 
-pub struct Trainer {
+pub struct Trainer<'d> {
     optimizer: Box<dyn Optimizer>,
     pub batch_size: usize,
     pub n_iterations: usize,
-    pub dataset: Dataset,
+    pub dataset: &'d Dataset,
     gradient: Network,
     grad_buf: Network,
     prop_buf: Vec<Vector>,
@@ -824,12 +845,12 @@ pub struct Trainer {
 }
 assert_impl_all!(Trainer: Send, Sync);
 
-impl Trainer {
+impl<'d> Trainer<'d> {
     const DEFAULT_BATCH_SIZE: usize = 1000;
     const DEFAULT_N_ITERATIONS: usize = 1000;
 
     pub fn new(
-        optimizer: impl Optimizer, dataset: Dataset, layout: &NetworkLayout,
+        optimizer: impl Optimizer, dataset: &'d Dataset, layout: &NetworkLayout,
     ) -> Self {
         Self {
             optimizer: Box::new(optimizer),
@@ -846,37 +867,46 @@ impl Trainer {
     pub fn execute(&mut self, network: &mut Network, log: TrainLog) {
         let is_logging_enabled = matches!(log, TrainLog::DrawLoading);
 
-        if is_logging_enabled {
-            _ = kdam::term::hide_cursor();
-        }
+        for _ in kdam::tqdm!(0..self.n_iterations, desc = "Iterating", position = 0) {
+            self.optimizer.reset();
 
-        for _ in kdam::tqdm!(0..self.n_iterations, desc = "Training", position = 0) {
-            self.gradient.fill(0.0);
+            let batches = kdam::tqdm!(
+                0..self.dataset.data.len() / self.batch_size,
+                desc = "Training",
+                position = 1
+            );
 
-            for _ in kdam::tqdm!(0..self.batch_size, desc = "Calculating gradient", position = 1) {
-                let index = rand::random::<usize>() % self.dataset.len();
-                let (input, expectation) = &self.dataset[index];
-                
-                network.execute(input, &mut self.neurons);
-                network.propagate_back(
-                    &mut self.grad_buf,
-                    expectation,
-                    &self.neurons,
-                    &mut self.prop_buf,
+            for batch_index in batches {
+                self.gradient.fill(0.0);
+
+                let start = (self.batch_size * batch_index) % self.dataset.data.len();
+
+                let data = kdam::tqdm!(
+                    self.dataset.data[start..].iter().take(self.batch_size),
+                    desc = "Calculating gradient",
+                    position = 2
                 );
 
-                self.gradient.mul_add(
-                    &self.grad_buf,
-                    1.0 / self.batch_size as f32,
-                );
+                for (input, expectation) in data {
+                    network.execute(input, &mut self.neurons);
+                    network.propagate_back(
+                        &mut self.grad_buf,
+                        expectation,
+                        &self.neurons,
+                        &mut self.prop_buf,
+                    );
+
+                    self.gradient.mul_add(
+                        &self.grad_buf,
+                        1.0 / self.batch_size as f32,
+                    );
+                }
+
+                self.optimizer.apply_gradient(network, &self.gradient);
             }
-
-            self.optimizer.apply_gradient(network, &self.gradient);
         }
 
-        
         if is_logging_enabled {
-            _ = kdam::term::show_cursor();
             eprint!("\n\n");
         }
     }
