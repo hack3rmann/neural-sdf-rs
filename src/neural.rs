@@ -1,8 +1,12 @@
-use crate::{math::{Vector, Matrix}, util::*};
+// FIXME:
+#![allow(unused)]
+
+use crate::{arch::{Arch, ArchLayer, ArchValue}, math::{Matrix, Vector}, util::*};
 use rayon::iter::IndexedParallelIterator;
 use static_assertions::*;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{io::{Bytes, Read}, sync::Arc};
+use thiserror::Error;
 
 
 
@@ -238,6 +242,23 @@ impl NetworkBuilder {
         );
 
         Network { transitions }
+    }
+}
+
+impl From<Arch> for NetworkBuilder {
+    fn from(value: Arch) -> Self {
+        let layer_transitions = value.values.iter()
+            .map(|value| match value.layer {
+                ArchLayer::Sin => LayerType::Sin,
+                ArchLayer::Dense => LayerType::Dense {
+                    inputs: value.n_inputs as usize,
+                    outputs: value.n_outputs as usize,
+                    initializer: Initializer::Siren,
+                },
+            })
+            .collect();
+
+        Self { layer_transitions }
     }
 }
 
@@ -526,6 +547,18 @@ impl Network {
         NetworkBuilder::new()
     }
 
+    pub fn fill_from_bytes(&mut self, mut bytes: impl Read) {
+        for transition in &mut self.transitions {
+            bytes.read_exact(
+                bytemuck::cast_slice_mut(&mut transition.weights.values),
+            );
+
+            bytes.read_exact(
+                bytemuck::cast_slice_mut(&mut transition.biases),
+            );
+        }
+    }
+
     /// Collects layout information of the network to do allocations
     pub fn layout(&self) -> NetworkLayout {
         NetworkLayout::from_network(self)
@@ -590,8 +623,8 @@ impl Network {
                         .activation_fn
                         .differential();
 
-                *value = (layer.activation[i] - expectation[i])
-                    / expectation.len() as f32
+                *value = 2.0 * (layer.activation[i] - expectation[i])
+                    / expectation.dimension() as f32
                     * activation_derivative(layer.input[i], None)
             });
 
@@ -654,7 +687,7 @@ impl Network {
 
 pub trait Optimizer: Send + Sync + 'static {
     fn apply_gradient(&mut self, network: &mut Network, gradient: &Network);
-    fn reset(&mut self);
+    fn update_epoch(&mut self);
 }
 assert_obj_safe!(Optimizer);
 
@@ -676,7 +709,7 @@ impl Optimizer for Constant {
         network.sub_gradient(gradient, self.learning_rate);
     }
 
-    fn reset(&mut self) { }
+    fn update_epoch(&mut self) { }
 }
 
 
@@ -736,10 +769,10 @@ impl Adam {
         *momentum1 = decay1 * *momentum1 + (1.0 - decay1) * gradient;
         *momentum2 = decay2 * *momentum2 + (1.0 - decay2) * gradient.powi(2);
 
-        let first_estimate = *momentum1 / (1.0 - decay1.powi(time));
-        let second_estimate = *momentum2 / (1.0 - decay2.powi(time));
+        let mhat1 = *momentum1 / (1.0 - decay1.powi(time));
+        let mhat2 = *momentum2 / (1.0 - decay2.powi(time));
 
-        *network -= step_size * first_estimate / (second_estimate.sqrt() + eps);
+        *network -= step_size * mhat1 / (mhat2.sqrt() + eps);
     }
 }
 
@@ -774,10 +807,75 @@ impl Optimizer for Adam {
             });
     }
 
-    fn reset(&mut self) {
+    fn update_epoch(&mut self) {
         self.first_momentum.fill(0.0);
         self.second_momentum.fill(0.0);
         self.time = 0;
+    }
+}
+
+
+
+#[derive(Clone, Debug)]
+pub struct RmsProp {
+    pub decay: f32,
+    eps: f32,
+    velocity: Network,
+    step_size: f32,
+}
+
+impl RmsProp {
+    pub const DECAY_DEFAULT: f32 = 0.9;
+
+    pub fn new(learning_rate: f32, layout: &NetworkLayout) -> Self {
+        Self {
+            decay: Self::DECAY_DEFAULT,
+            eps: 1e-8,
+            velocity: layout.allocate_gradient(),
+            step_size: learning_rate,
+        }
+    }
+
+    pub const fn decay(mut self, value: f32) -> Self {
+        self.decay = value;
+        self
+    }
+
+    pub fn update_value(
+        eps: f32, decay: f32, step_size: f32, velocity: &mut f32,
+        gradient: f32, netwrork: &mut f32,
+    ) {
+        *velocity = decay * *velocity + (1.0 - decay) * gradient.powi(2);
+        *netwrork -= step_size * gradient / f32::sqrt(*velocity + eps);
+    }
+}
+
+impl Optimizer for RmsProp {
+    fn apply_gradient(&mut self, network: &mut Network, gradient: &Network) {
+        use rayon::prelude::*;
+
+        self.velocity.transitions.par_iter_mut()
+            .zip(gradient.transitions.par_iter())
+            .zip(network.transitions.par_iter_mut())
+            .flat_map(|((velocity, gradient), network)| {
+                velocity.par_values_mut()
+                    .zip(gradient.par_values())
+                    .zip(network.par_values_mut())
+            })
+            .for_each(|((velocity, gradient), network)| {
+                Self::update_value(
+                    self.eps,
+                    self.decay,
+                    self.step_size,
+                    velocity,
+                    gradient,
+                    network,
+                );
+            });
+    }
+
+    fn update_epoch(&mut self) {
+        self.velocity.fill(0.0);
     }
 }
 
@@ -796,7 +894,7 @@ impl Dataset {
         Self { data: vec![] }
     }
 
-    pub fn from_generator(size: usize, gen: impl Fn() -> (Vector, Vector)) -> Self {
+    pub fn from_fn(size: usize, gen: impl Fn() -> (Vector, Vector)) -> Self {
         Self { data: (0..size).map(move |_| gen()).collect() }
     }
 }
@@ -868,7 +966,7 @@ impl<'d> Trainer<'d> {
         let is_logging_enabled = matches!(log, TrainLog::DrawLoading);
 
         for _ in kdam::tqdm!(0..self.n_iterations, desc = "Iterating", position = 0) {
-            self.optimizer.reset();
+            self.optimizer.update_epoch();
 
             let batches = kdam::tqdm!(
                 0..self.dataset.data.len() / self.batch_size,
@@ -887,6 +985,8 @@ impl<'d> Trainer<'d> {
                     position = 2
                 );
 
+                let data_len = data.len();
+
                 for (input, expectation) in data {
                     network.execute(input, &mut self.neurons);
                     network.propagate_back(
@@ -896,10 +996,7 @@ impl<'d> Trainer<'d> {
                         &mut self.prop_buf,
                     );
 
-                    self.gradient.mul_add(
-                        &self.grad_buf,
-                        1.0 / self.batch_size as f32,
-                    );
+                    self.gradient.mul_add(&self.grad_buf, 1.0 / data_len as f32);
                 }
 
                 self.optimizer.apply_gradient(network, &self.gradient);
