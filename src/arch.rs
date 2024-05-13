@@ -71,7 +71,7 @@ pub mod parser {
     }
 
     pub fn spaces<'a>() -> Parser<'a, &'a str> {
-        one_of(" \n\t").repeat(1..).collect()
+        one_of(" \n\t").repeat(0..).collect()
     }
 
     pub fn line<'a>() -> Parser<'a, ArchValue> {
@@ -88,7 +88,9 @@ pub mod parser {
     }
 
     pub fn arch<'a>() -> Parser<'a, Arch> {
-        list(line(), spaces()).map(|values| Arch { values })
+        spaces()
+            * list(line(), spaces()).map(|values| Arch { values })
+            - end()
     }
 
     #[cfg(test)]
@@ -131,7 +133,7 @@ pub mod parser {
         #[test]
         #[should_panic]
         fn unparse() {
-            const ARCH: &str = r"Dense input shape (42a) output shape (69)";
+            const ARCH: &str = r"Dense input shape (42) output shape (69)";
 
             println!("{:?}", ARCH.parse::<Arch>().unwrap());
         }
