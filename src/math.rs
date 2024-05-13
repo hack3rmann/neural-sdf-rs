@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 

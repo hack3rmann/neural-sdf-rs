@@ -1120,19 +1120,4 @@ mod tests {
 
         eprintln!("MSE after = {}", result.mse(&expecation));
     }
-
-    #[test]
-    fn network_ser() {
-        let network = Network::builder()
-            .layer(Dense::new(2, 8))
-            .layer(Sin)
-            .layer(Dense::new(8, 10))
-            .layer(Relu)
-            .layer(Dense::new(10, 1))
-            .build();
-
-        let out = serde_json::to_string_pretty(&network).unwrap();
-
-        eprintln!("{out}");
-    }
 }
